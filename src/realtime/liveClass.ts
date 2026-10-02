@@ -8,6 +8,7 @@ import {
   updateLiveClassRemote,
 } from "../utils/internalApi.js";
 import { createClassAccessToken, roomService, setMicrophoneGranted, setScreenShareGranted } from "../utils/livekit.js";
+import { hasPermission, isAdminTier } from "../utils/permissions.js";
 
 type MicState = "HOST" | "MUTED" | "APPROVED";
 
@@ -40,6 +41,41 @@ function anonLabelFor(state: ClassroomState, userId: string): string {
     state.anonLabels.set(userId, label);
   }
   return label;
+}
+
+function chatRoom(liveClassId: string, channel: "male" | "female"): string {
+  return `class:${liveClassId}:chat:${channel}`;
+}
+
+/**
+ * Which gender-chat channel(s) this socket may read/post to -- the ONE
+ * place this is decided, never trusted from the client. A normal
+ * student gets exactly their own gender, read from the authenticated
+ * user record (socket.data.gender, set during socket auth from the
+ * main API's internal endpoint -- never anything the client claims
+ * about itself). The host of THIS class, any admin-tier account, or a
+ * LEADER explicitly granted classroom.chat_male/classroom.chat_female
+ * gets both channels (or whichever ones they were granted), matching
+ * spec section 10's "super-admin can see both channels simultaneously
+ * if desired".
+ */
+function accessibleChatChannels(opts: {
+  isHost: boolean;
+  accountRole: string;
+  permissions: string;
+  gender: string | null;
+}): Array<"male" | "female"> {
+  const channels = new Set<"male" | "female">();
+  if (opts.isHost || isAdminTier(opts.accountRole) || hasPermission(opts.accountRole, opts.permissions, "classroom.chat_male")) {
+    channels.add("male");
+  }
+  if (opts.isHost || isAdminTier(opts.accountRole) || hasPermission(opts.accountRole, opts.permissions, "classroom.chat_female")) {
+    channels.add("female");
+  }
+  if (channels.size === 0 && opts.gender) {
+    channels.add(opts.gender === "MALE" ? "male" : "female");
+  }
+  return [...channels];
 }
 
 // One entry per LIVE class. Ephemeral by design attendance and the class
@@ -158,6 +194,19 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     socket.join(`class:${liveClassId}`);
     socket.data.currentClassId = liveClassId;
 
+    // Gender-chat room membership, decided entirely server-side (see
+    // accessibleChatChannels) -- a student is placed in exactly their
+    // own gender's room and nothing else; the host/admin-tier/granted
+    // leader is placed in whichever channel(s) they're actually
+    // authorized for, never something the client gets to request.
+    const chatChannels = accessibleChatChannels({
+      isHost,
+      accountRole,
+      permissions: socket.data.permissions ?? "[]",
+      gender: socket.data.gender ?? null,
+    });
+    chatChannels.forEach((channel) => socket.join(chatRoom(liveClassId, channel)));
+
     await createAttendanceRemote(liveClassId, userId);
     await trackActivity(userId, "CLASS_JOIN", { liveClassId, role: participant.role });
 
@@ -181,6 +230,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       locked: state.locked,
       namesRevealed: state.namesRevealed,
       canModerateChat: isHost || state.chatModerators.has(userId),
+      chatChannels,
       livekitToken,
       livekitUrl: process.env.LIVEKIT_URL,
     });
@@ -425,24 +475,44 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
   // ---- classroom chat (ephemeral a text side-channel for the room, not a
   // persisted conversation like ChatPage's DMs; nothing to send if you're
   // not currently a participant of that class) ----
-  socket.on("classroom:chat-message", ({ liveClassId, body }) => {
+  socket.on("classroom:chat-message", ({ liveClassId, body, channel }) => {
     const text = String(body ?? "").trim().slice(0, 1000);
     if (!text) return;
     const state = classrooms.get(liveClassId);
     const sender = state?.participants.get(userId);
     if (!state || !sender) return;
 
+    // The channel this message ACTUALLY goes to is decided here, never
+    // taken from the client as given -- a plain student (exactly one
+    // accessible channel, their own gender) always posts there
+    // regardless of what `channel` claims; only someone with access to
+    // BOTH channels (host/admin-tier/granted leader) gets their
+    // requested channel honored, and even then only if it's one they're
+    // actually authorized for. This is what actually stops the spec's
+    // "student manually sends channel=female-chat" attack -- not
+    // hiding the option in the UI, which this check doesn't even trust.
+    const accessible = accessibleChatChannels({
+      isHost: sender.role === "HOST",
+      accountRole: sender.accountRole,
+      permissions: socket.data.permissions ?? "[]",
+      gender: socket.data.gender ?? null,
+    });
+    if (accessible.length === 0) return; // no gender on file and no grant -- nowhere to send
+    const requested = channel === "male" || channel === "female" ? channel : null;
+    const effectiveChannel = requested && accessible.includes(requested) ? requested : accessible[0];
+
     // Identity is hidden by default (per spec) the SERVER decides what
     // name goes out, not the client, so there's no real name in the socket
     // payload at all while hidden (not just visually hidden in the UI).
     const displayName = state.namesRevealed ? fullName : anonLabelFor(state, userId);
 
-    io.to(`class:${liveClassId}`).emit("classroom:chat-message", {
+    io.to(chatRoom(liveClassId, effectiveChannel)).emit("classroom:chat-message", {
       id: `${socket.id}-${Date.now()}`,
       userId,
       fullName: displayName,
       anonymous: !state.namesRevealed,
       role: sender.role,
+      channel: effectiveChannel,
       body: text,
       at: new Date().toISOString(),
     });

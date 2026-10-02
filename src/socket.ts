@@ -41,6 +41,15 @@ export function initSocket(httpServer: HttpServer) {
       socket.data.userId = user.id;
       socket.data.fullName = user.fullName;
       socket.data.accountRole = user.role;
+      // Needed for gender-scoped chat room assignment (classroom:join in
+      // liveClass.ts) -- gender comes from the AUTHENTICATED user record
+      // fetched above, never anything the client could claim about
+      // itself, exactly per spec. permissions backs hasPermission()
+      // checks for classroom.chat_male/classroom.chat_female the same
+      // way a LEADER can be granted either or both without being
+      // admin-tier.
+      socket.data.gender = user.gender;
+      socket.data.permissions = user.permissions;
       next();
     } catch {
       next(new Error("unauthenticated"));
