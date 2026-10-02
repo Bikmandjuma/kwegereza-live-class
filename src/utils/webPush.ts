@@ -40,7 +40,14 @@ export async function sendPushToUser(
             endpoint: sub.endpoint,
             keys: { p256dh: sub.p256dh, auth: sub.auth },
           },
-          JSON.stringify(payload)
+          JSON.stringify(payload),
+          // Same reasoning as the main API's copy of this file: without
+          // urgency "high", a "live class starting" push can be silently
+          // deferred by the push service while a student's phone is in
+          // battery-saver/Doze with the screen off -- exactly when they're
+          // using another app, which is the one moment this notification
+          // actually needs to arrive.
+          { urgency: "high", TTL: 24 * 60 * 60 }
         );
         sent++;
       } catch (err: any) {

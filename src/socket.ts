@@ -1,7 +1,7 @@
 import type { Server as HttpServer } from "http";
 import { Server, type Socket } from "socket.io";
 import { verifyToken } from "./utils/jwt.js";
-import { prisma } from "./utils/prisma.js";
+import { getUserForAuthCached } from "./utils/internalApi.js";
 import { registerLiveClassHandlers } from "./realtime/liveClass.js";
 import { setIo } from "./realtime/ioInstance.js";
 
@@ -19,7 +19,7 @@ import { setIo } from "./realtime/ioInstance.js";
 export function initSocket(httpServer: HttpServer) {
   const io = new Server(httpServer, {
     cors: {
-      origin: process.env.CORS_ORIGIN ?? " https://kwegereza.org",
+      origin: process.env.CORS_ORIGIN ?? "http://localhost:5173",
       credentials: true,
     },
   });
@@ -32,7 +32,7 @@ export function initSocket(httpServer: HttpServer) {
       if (!token) return next(new Error("unauthenticated"));
 
       const payload = verifyToken(token);
-      const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+      const user = await getUserForAuthCached(payload.sub);
 
       if (!user || user.tokenVersion !== payload.tokenVersion || user.status !== "ACTIVE") {
         return next(new Error("unauthenticated"));

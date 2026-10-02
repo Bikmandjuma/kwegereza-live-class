@@ -1,16 +1,13 @@
 import type { Server, Socket } from "socket.io";
-import { prisma } from "../utils/prisma.js";
-import { trackEvent } from "../utils/activity.js";
 import {
-  getOrCreateRoom,
-  getRoom,
-  getOrCreatePeerMedia,
-  createWebRtcTransport,
-  listRoomProducers,
-  removePeer as removePeerMedia,
-  closeRoom as closeRoomMedia,
-  type MediaTag,
-} from "./mediasoup/rooms.js";
+  closeAttendanceRemote,
+  createAttendanceRemote,
+  getLiveClassRemote,
+  getUserForAuth,
+  trackActivity,
+  updateLiveClassRemote,
+} from "../utils/internalApi.js";
+import { createClassAccessToken, roomService, setMicrophoneGranted, setScreenShareGranted } from "../utils/livekit.js";
 
 type MicState = "HOST" | "MUTED" | "APPROVED";
 
@@ -22,6 +19,8 @@ interface Participant {
   accountRole: string; // real account role (STUDENT/LEADER/ADMIN) lets the host find leaders to delegate chat-moderation to
   micState: MicState;
   handRaised: boolean;
+  screenShareApproved: boolean;
+  screenShareRequested: boolean;
 }
 
 interface ClassroomState {
@@ -57,6 +56,8 @@ function publicParticipant(p: Participant) {
     accountRole: p.accountRole,
     micState: p.micState,
     handRaised: p.handRaised,
+    screenShareApproved: p.screenShareApproved,
+    screenShareRequested: p.screenShareRequested,
   };
 }
 
@@ -73,17 +74,12 @@ export async function endLiveClass(io: Server | null, liveClassId: string) {
   const state = classrooms.get(liveClassId);
 
   if (state) {
-    // Close out attendance for everyone still "in" the room.
-    await prisma.liveClassAttendance.updateMany({
-      where: { liveClassId, userId: { in: Array.from(state.participants.keys()) }, leftAt: null },
-      data: { leftAt: new Date() },
-    });
+    // Close out attendance for everyone still "in" the room (omitting
+    // both userId/userIds closes every still-open row for this class).
+    await closeAttendanceRemote({ liveClassId });
   }
 
-  const updated = await prisma.liveClass.update({
-    where: { id: liveClassId },
-    data: { status: "ENDED", endedAt: new Date() },
-  });
+  const updated = await updateLiveClassRemote(liveClassId, { status: "ENDED", endedAt: new Date().toISOString() });
 
   if (io && state) {
     io.to(`class:${liveClassId}`).emit("classroom:ended", { liveClassId });
@@ -97,10 +93,12 @@ export async function endLiveClass(io: Server | null, liveClassId: string) {
   }
 
   classrooms.delete(liveClassId);
-  // Tear down this class's mediasoup router + every peer's transports/
-  // producers/consumers along with it nothing should keep publishing
-  // audio/video into a class that has ended.
-  closeRoomMedia(liveClassId);
+  // Ends the actual LiveKit room, disconnecting every connected media
+  // session along with it nothing should keep publishing audio/screen
+  // into a class that has ended. Best-effort: a room that was never
+  // created (nobody's LiveKit token was ever actually used to connect)
+  // isn't an error here.
+  await roomService.deleteRoom(liveClassId).catch(() => {});
   return updated;
 }
 
@@ -110,7 +108,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
   const accountRole: string = socket.data.accountRole ?? "STUDENT";
 
   socket.on("classroom:join", async ({ liveClassId }, ack) => {
-    const liveClass = await prisma.liveClass.findUnique({ where: { id: liveClassId } });
+    const liveClass = await getLiveClassRemote(liveClassId);
     if (!liveClass || liveClass.status !== "LIVE") {
       ack?.({ ok: false, error: "Iri somo ntiriho ubu (ntabwo ari live)." });
       return;
@@ -153,15 +151,28 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       // never inherit an elevated state from a previous session.
       micState: isHost ? "HOST" : existing?.micState === "APPROVED" ? "APPROVED" : "MUTED",
       handRaised: existing?.handRaised ?? false,
+      screenShareApproved: isHost ? true : existing?.screenShareApproved ?? false,
+      screenShareRequested: existing?.screenShareRequested ?? false,
     };
     state.participants.set(userId, participant);
     socket.join(`class:${liveClassId}`);
     socket.data.currentClassId = liveClassId;
 
-    await prisma.liveClassAttendance.create({
-      data: { liveClassId, userId },
+    await createAttendanceRemote(liveClassId, userId);
+    await trackActivity(userId, "CLASS_JOIN", { liveClassId, role: participant.role });
+
+    // The LiveKit token encodes the REAL starting grants (see
+    // createClassAccessToken): a host can publish mic + screen share
+    // immediately, a student can only subscribe and send data until the
+    // host approves them via the handlers below, which update this same
+    // token's underlying permissions on LiveKit's own server directly —
+    // no new token or page reload needed for an approval to take effect.
+    const livekitToken = await createClassAccessToken({
+      identity: userId,
+      name: fullName,
+      roomName: liveClassId,
+      isHost,
     });
-    await trackEvent(userId, "CLASS_JOIN", { liveClassId, role: participant.role });
 
     ack?.({
       ok: true,
@@ -170,6 +181,8 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       locked: state.locked,
       namesRevealed: state.namesRevealed,
       canModerateChat: isHost || state.chatModerators.has(userId),
+      livekitToken,
+      livekitUrl: process.env.LIVEKIT_URL,
     });
     socket.to(`class:${liveClassId}`).emit("classroom:participant-joined", publicParticipant(participant));
   });
@@ -203,7 +216,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       return;
     }
     state.locked = true;
-    await prisma.liveClass.update({ where: { id: liveClassId }, data: { locked: true } });
+    await updateLiveClassRemote(liveClassId, { locked: true });
     io.to(`class:${liveClassId}`).emit("classroom:locked");
     ack?.({ ok: true });
   });
@@ -215,7 +228,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       return;
     }
     state.locked = false;
-    await prisma.liveClass.update({ where: { id: liveClassId }, data: { locked: false } });
+    await updateLiveClassRemote(liveClassId, { locked: false });
     io.to(`class:${liveClassId}`).emit("classroom:unlocked");
     ack?.({ ok: true });
   });
@@ -240,7 +253,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     ack?.({ ok: true });
   });
 
-  socket.on("classroom:approve-speaker", ({ liveClassId, targetUserId }, ack) => {
+  socket.on("classroom:approve-speaker", async ({ liveClassId, targetUserId }, ack) => {
     const state = requireHost(liveClassId);
     if (!state) {
       ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
@@ -253,12 +266,13 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     }
     target.micState = "APPROVED";
     target.handRaised = false;
+    await setMicrophoneGranted(liveClassId, targetUserId, true);
     io.to(`class:${liveClassId}`).emit("classroom:participant-updated", publicParticipant(target));
     io.to(target.socketId).emit("classroom:speaker-approved", { liveClassId });
     ack?.({ ok: true });
   });
 
-  socket.on("classroom:revoke-speaker", ({ liveClassId, targetUserId }, ack) => {
+  socket.on("classroom:revoke-speaker", async ({ liveClassId, targetUserId }, ack) => {
     const state = requireHost(liveClassId);
     if (!state) {
       ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
@@ -270,38 +284,94 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       return;
     }
     target.micState = "MUTED";
+    await setMicrophoneGranted(liveClassId, targetUserId, false);
     io.to(`class:${liveClassId}`).emit("classroom:participant-updated", publicParticipant(target));
     io.to(target.socketId).emit("classroom:speaker-revoked", { liveClassId });
     ack?.({ ok: true });
   });
 
-  socket.on("classroom:mute-all", ({ liveClassId }, ack) => {
+  socket.on("classroom:mute-all", async ({ liveClassId }, ack) => {
     const state = requireHost(liveClassId);
     if (!state) {
       ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
       return;
     }
-    for (const p of state.participants.values()) {
-      if (p.role === "PARTICIPANT") {
-        p.micState = "MUTED";
-        p.handRaised = false;
-      }
+    const targets = Array.from(state.participants.values()).filter((p) => p.role === "PARTICIPANT");
+    for (const p of targets) {
+      p.micState = "MUTED";
+      p.handRaised = false;
     }
+    // One LiveKit call per student, not awaited sequentially a slow
+    // class with many hands up shouldn't make "mute everyone" feel laggy.
+    await Promise.all(targets.map((p) => setMicrophoneGranted(liveClassId, p.userId, false)));
     io.to(`class:${liveClassId}`).emit("classroom:muted-all");
     io.to(`class:${liveClassId}`).emit("classroom:participants", participantList(state));
     ack?.({ ok: true });
   });
 
-  // Symmetric with mute-all, but for cameras: tells every connected client to
-  // stop its own camera track (each client owns and stops its own hardware —
-  // the server never touches anyone's device).
-  socket.on("classroom:disable-all-cameras", ({ liveClassId }, ack) => {
+  // ---- screen share: its own, SEPARATE permission from the microphone
+  // approval above -- being allowed to speak says nothing about being
+  // allowed to share a screen, and the teacher/host always has it by
+  // default (see createClassAccessToken). ----
+  socket.on("classroom:request-screen-share", ({ liveClassId }) => {
+    const state = classrooms.get(liveClassId);
+    const p = state?.participants.get(userId);
+    if (!state || !p || p.role !== "PARTICIPANT") return;
+    p.screenShareRequested = true;
+    io.to(`class:${liveClassId}`).emit("classroom:screen-share-requested", { userId, fullName });
+  });
+
+  socket.on("classroom:deny-screen-share", ({ liveClassId, targetUserId }, ack) => {
     const state = requireHost(liveClassId);
     if (!state) {
       ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
       return;
     }
-    io.to(`class:${liveClassId}`).emit("classroom:cameras-disabled");
+    const target = state.participants.get(targetUserId);
+    if (!target) {
+      ack?.({ ok: false, error: "Uwo mwigishwa ntaboneka mu ishuri." });
+      return;
+    }
+    target.screenShareRequested = false;
+    io.to(`class:${liveClassId}`).emit("classroom:participant-updated", publicParticipant(target));
+    io.to(target.socketId).emit("classroom:screen-share-denied", { liveClassId });
+    ack?.({ ok: true });
+  });
+
+  socket.on("classroom:approve-screen-share", async ({ liveClassId, targetUserId }, ack) => {
+    const state = requireHost(liveClassId);
+    if (!state) {
+      ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
+      return;
+    }
+    const target = state.participants.get(targetUserId);
+    if (!target) {
+      ack?.({ ok: false, error: "Uwo mwigishwa ntaboneka mu ishuri." });
+      return;
+    }
+    target.screenShareApproved = true;
+    target.screenShareRequested = false;
+    await setScreenShareGranted(liveClassId, targetUserId, true);
+    io.to(`class:${liveClassId}`).emit("classroom:participant-updated", publicParticipant(target));
+    io.to(target.socketId).emit("classroom:screen-share-approved", { liveClassId });
+    ack?.({ ok: true });
+  });
+
+  socket.on("classroom:revoke-screen-share", async ({ liveClassId, targetUserId }, ack) => {
+    const state = requireHost(liveClassId);
+    if (!state) {
+      ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
+      return;
+    }
+    const target = state.participants.get(targetUserId);
+    if (!target) {
+      ack?.({ ok: false, error: "Uwo mwigishwa ntaboneka mu ishuri." });
+      return;
+    }
+    target.screenShareApproved = false;
+    await setScreenShareGranted(liveClassId, targetUserId, false);
+    io.to(`class:${liveClassId}`).emit("classroom:participant-updated", publicParticipant(target));
+    io.to(target.socketId).emit("classroom:screen-share-revoked", { liveClassId });
     ack?.({ ok: true });
   });
 
@@ -332,12 +402,9 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     io.to(target.socketId).emit("classroom:removed", { liveClassId });
     io.sockets.sockets.get(target.socketId)?.leave(`class:${liveClassId}`);
     state.participants.delete(targetUserId);
-    await prisma.liveClassAttendance.updateMany({
-      where: { liveClassId, userId: targetUserId, leftAt: null },
-      data: { leftAt: new Date() },
-    });
+    await closeAttendanceRemote({ liveClassId, userId: targetUserId });
     io.to(`class:${liveClassId}`).emit("classroom:participant-left", { userId: targetUserId });
-    removePeerMedia(liveClassId, targetUserId);
+    await roomService.removeParticipant(liveClassId, targetUserId).catch(() => {});
     ack?.({ ok: true });
   });
 
@@ -413,7 +480,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora kubyemeza." });
       return;
     }
-    const target = await prisma.user.findUnique({ where: { id: targetUserId } });
+    const target = await getUserForAuth(targetUserId);
     if (!target || !["LEADER", "ADMIN"].includes(target.role)) {
       ack?.({ ok: false, error: "Uburenganzira busa bwahabwa gusa Abayobozi (LEADER/ADMIN)." });
       return;
@@ -436,182 +503,12 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     ack?.({ ok: true });
   });
 
-  // ---- mediasoup: real SFU media, replacing the old peer-to-peer mesh ----
-  // The classroom/host-control logic above (participants, mic approval,
-  // raise-hand, lock, chat) is untouched only the actual audio/video
-  // transport changes. Every handler re-checks that the caller is a known
-  // participant of this class (and, where relevant, the host) before
-  // touching mediasoup state; nothing here trusts the client's claims.
-
-  function currentParticipant(liveClassId: string) {
-    const state = classrooms.get(liveClassId);
-    return state?.participants.get(userId);
-  }
-
-  function canProduce(liveClassId: string, mediaTag: MediaTag): boolean {
-    const participant = currentParticipant(liveClassId);
-    if (!participant) return false;
-    if (participant.role === "HOST") return true;
-    // A regular participant may only publish their own mic, and only once
-    // the host has approved them to speak same rule that already
-    // governs `micState` for the UI, now enforced for the actual media too.
-    return mediaTag === "mic" && participant.micState === "APPROVED";
-  }
-
-  socket.on("media:get-rtp-capabilities", async ({ liveClassId }, ack) => {
-    if (!currentParticipant(liveClassId)) {
-      ack?.({ ok: false, error: "Ntabwo uri mu isomo." });
-      return;
-    }
-    const room = await getOrCreateRoom(liveClassId);
-    ack?.({ ok: true, rtpCapabilities: room.router.rtpCapabilities });
-  });
-
-  socket.on("media:get-producers", async ({ liveClassId }, ack) => {
-    const room = getRoom(liveClassId);
-    if (!currentParticipant(liveClassId) || !room) {
-      ack?.({ ok: false, error: "Isomo ntabwo riraboneka." });
-      return;
-    }
-    ack?.({ ok: true, producers: listRoomProducers(room).filter((p) => p.userId !== userId) });
-  });
-
-  socket.on("media:create-transport", async ({ liveClassId, direction }, ack) => {
-    if (!currentParticipant(liveClassId)) {
-      ack?.({ ok: false, error: "Ntabwo uri mu isomo." });
-      return;
-    }
-    const room = await getOrCreateRoom(liveClassId);
-    const peerMedia = getOrCreatePeerMedia(room, userId);
-    const transport = await createWebRtcTransport(room.router);
-
-    if (direction === "send") peerMedia.sendTransport = transport;
-    else peerMedia.recvTransport = transport;
-
-    ack?.({
-      ok: true,
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-    });
-  });
-
-  socket.on("media:connect-transport", async ({ liveClassId, transportId, dtlsParameters }, ack) => {
-    const room = getRoom(liveClassId);
-    const peerMedia = room?.peers.get(userId);
-    if (!peerMedia) {
-      ack?.({ ok: false, error: "Transport ntiboneka." });
-      return;
-    }
-    const transport =
-      peerMedia.sendTransport?.id === transportId
-        ? peerMedia.sendTransport
-        : peerMedia.recvTransport?.id === transportId
-        ? peerMedia.recvTransport
-        : undefined;
-    if (!transport) {
-      ack?.({ ok: false, error: "Transport ntiboneka." });
-      return;
-    }
-    try {
-      await transport.connect({ dtlsParameters });
-      ack?.({ ok: true });
-    } catch (err: any) {
-      ack?.({ ok: false, error: err?.message ?? "Guhuza transport byanze." });
-    }
-  });
-
-  socket.on("media:produce", async ({ liveClassId, kind, mediaKind, rtpParameters }, ack) => {
-    const mediaTag = kind as MediaTag;
-    if (!canProduce(liveClassId, mediaTag)) {
-      ack?.({ ok: false, error: "Ntabwo wemerewe kohereza iyi stream." });
-      return;
-    }
-    const room = getRoom(liveClassId);
-    const peerMedia = room?.peers.get(userId);
-    if (!room || !peerMedia?.sendTransport) {
-      ack?.({ ok: false, error: "Ntabwo transport iraboneka." });
-      return;
-    }
-    const producer = await peerMedia.sendTransport.produce({ kind: mediaKind, rtpParameters });
-    // Replacing an existing producer of the same tag (e.g. mic re-enabled
-    // after being toggled off) rather than accumulating stale ones.
-    const previous = peerMedia.producers.get(mediaTag);
-    if (previous && !previous.closed) previous.close();
-    peerMedia.producers.set(mediaTag, producer);
-
-    producer.on("transportclose", () => peerMedia.producers.delete(mediaTag));
-
-    socket.to(`class:${liveClassId}`).emit("media:new-producer", {
-      fromUserId: userId,
-      producerId: producer.id,
-      mediaTag,
-    });
-    ack?.({ ok: true, producerId: producer.id });
-  });
-
-  socket.on("media:close-producer", ({ liveClassId, kind }) => {
-    const room = getRoom(liveClassId);
-    const peerMedia = room?.peers.get(userId);
-    const producer = peerMedia?.producers.get(kind as MediaTag);
-    if (!peerMedia || !producer) return;
-    producer.close();
-    peerMedia.producers.delete(kind as MediaTag);
-    io.to(`class:${liveClassId}`).emit("media:producer-closed", { fromUserId: userId, mediaTag: kind });
-  });
-
-  socket.on("media:consume", async ({ liveClassId, producerId, rtpCapabilities }, ack) => {
-    const room = getRoom(liveClassId);
-    if (!currentParticipant(liveClassId) || !room) {
-      ack?.({ ok: false, error: "Isomo ntabwo riraboneka." });
-      return;
-    }
-    if (!room.router.canConsume({ producerId, rtpCapabilities })) {
-      ack?.({ ok: false, error: "Iyi stream ntishobora gukurikiranwa n\'iyi device." });
-      return;
-    }
-    const peerMedia = getOrCreatePeerMedia(room, userId);
-    if (!peerMedia.recvTransport) {
-      ack?.({ ok: false, error: "Ntabwo recv transport iraboneka fungura transport mbere." });
-      return;
-    }
-    // Created paused: the client resumes it explicitly once the track is
-    // attached to an <audio>/<video> element, avoiding a burst of frames
-    // arriving before anything is listening for them.
-    const consumer = await peerMedia.recvTransport.consume({
-      producerId,
-      rtpCapabilities,
-      paused: true,
-    });
-    peerMedia.consumers.set(consumer.id, consumer);
-    consumer.on("transportclose", () => peerMedia.consumers.delete(consumer.id));
-    consumer.on("producerclose", () => {
-      peerMedia.consumers.delete(consumer.id);
-      io.to(socket.id).emit("media:producer-closed", { producerId });
-    });
-
-    ack?.({
-      ok: true,
-      id: consumer.id,
-      producerId,
-      kind: consumer.kind,
-      rtpParameters: consumer.rtpParameters,
-    });
-  });
-
-  socket.on("media:resume-consumer", async ({ liveClassId, consumerId }, ack) => {
-    const room = getRoom(liveClassId);
-    const peerMedia = room?.peers.get(userId);
-    const consumer = peerMedia?.consumers.get(consumerId);
-    if (!consumer) {
-      ack?.({ ok: false, error: "Consumer ntiboneka." });
-      return;
-    }
-    await consumer.resume();
-    ack?.({ ok: true });
-  });
-
+  // LiveKit itself tears down the actual media session automatically
+  // once this socket (and the WebSocket it rode in on) disconnects --
+  // nothing here needs to explicitly close any transport or producer,
+  // unlike the old mediasoup setup. What's left to do server-side is
+  // purely Kwegereza's own bookkeeping: attendance, presence, and
+  // telling the rest of the room someone left.
   socket.on("disconnect", async () => {
     const liveClassId: string | undefined = socket.data.currentClassId;
     if (!liveClassId) return;
@@ -621,12 +518,8 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     if (!p || p.socketId !== socket.id) return; // a newer connection already replaced this one
 
     state.participants.delete(userId);
-    await prisma.liveClassAttendance.updateMany({
-      where: { liveClassId, userId, leftAt: null },
-      data: { leftAt: new Date() },
-    });
-    await trackEvent(userId, "CLASS_LEAVE", { liveClassId });
-    removePeerMedia(liveClassId, userId);
+    await closeAttendanceRemote({ liveClassId, userId });
+    await trackActivity(userId, "CLASS_LEAVE", { liveClassId });
 
     if (state.hostId === userId) {
       io.to(`class:${liveClassId}`).emit("classroom:host-disconnected", { liveClassId });

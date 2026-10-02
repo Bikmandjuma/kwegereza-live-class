@@ -1,22 +1,6 @@
-/**
- * Live classroom signaling test this is the spec's "LIVE CLASS TEST" made
- * real at the signaling/state-machine layer: host starts a class, a student
- * joins muted, raises a hand, gets approved, gets muted-all'd, gets removed,
- * and the class is ended with the server as the single source of truth at
- * every step.
- *
- * IMPORTANT HONESTY NOTE: this verifies the SIGNALING PROTOCOL and permission
- * state machine not actual audio. Real microphone/speaker audio can only be
- * verified in an actual browser with real hardware, which this script can't
- * do. The WebRTC offer/answer/ICE relay is tested here as opaque payloads
- * (fake SDP strings) to confirm the server routes them to the right socket
- * and enforces the host-hub topology not that real audio flows.
- *
- * Run with: npx tsx scripts/test-liveclass.ts   (server must be running)
- */
 import { io as ioClient, type Socket } from "socket.io-client";
 
-const API = process.env.LIVE_CLASS_TEST_URL ?? " https://live_api.kwegereza.org";
+const API = process.env.LIVE_CLASS_TEST_URL ?? "http://localhost:4001";
 
 async function login(email: string, password: string) {
   const res = await fetch(`${API}/api/auth/login`, {

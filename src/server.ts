@@ -2,8 +2,6 @@ import "dotenv/config";
 import { createServer } from "http";
 import { createApp } from "./app.js";
 import { initSocket } from "./socket.js";
-import { initMediasoupWorkers } from "./realtime/mediasoup/workers.js";
-import { prisma } from "./utils/prisma.js";
 
 const PORT = Number(process.env.PORT) || 4001;
 const HOST = "0.0.0.0";
@@ -14,20 +12,20 @@ const httpServer = createServer(app);
 initSocket(httpServer);
 
 async function start() {
-  // Mediasoup workers must exist before any "classroom:join"/"media:*"
-  // socket event can be handled -- do this before accepting traffic. This
-  // native module load (and the workers it spawns) is EXACTLY what the
-  // main API's shared/cPanel hosting can't run, which is the entire
-  // reason this is its own service on its own VPS.
-  await initMediasoupWorkers();
-
+  // No native worker to spawn here anymore: the actual WebRTC media
+  // (audio, screen share) is handled entirely by the separately-hosted
+  // LiveKit server, reached over the network via livekit-server-sdk
+  // (see src/utils/livekit.ts). This service also has no database of
+  // its own at all anymore -- everything that needs persistence goes
+  // through the main API's internal API (see src/utils/internalApi.ts)
+  // instead of a direct connection to the shared database. Nothing
+  // here needs anything heavier than a normal Node process.
   const server = httpServer.listen(PORT, HOST, () => {
     console.log(`Kwegereza Live Class API listening on port ${PORT}`);
-    console.log("Socket.IO realtime (live-class media signaling) live on the same port");
+    console.log("Socket.IO realtime (live-class control plane) live on the same port");
   });
 
-  async function shutdown(): Promise<void> {
-    await prisma.$disconnect();
+  function shutdown(): void {
     server.close(() => {
       process.exit(0);
     });

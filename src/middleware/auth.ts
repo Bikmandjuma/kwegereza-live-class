@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { verifyToken } from "../utils/jwt.js";
-import { prisma } from "../utils/prisma.js";
+import { getUserForAuthCached } from "../utils/internalApi.js";
 import { sendError } from "../utils/apiResponse.js";
 import { hasPermission } from "../utils/permissions.js";
 import { asyncHandler } from "./asyncHandler.js";
@@ -15,10 +15,8 @@ const STATUS_MESSAGES: Record<string, string> = {
 };
 
 /**
- * Verifies the JWT AND re-reads the user from the database on every request.
- * This is deliberate: if an admin blocks a user mid-session, that user's very
- * next request must be rejected trusting only the token would let a blocked
- * user keep working until the token naturally expires.
+ * Verifies the JWT and checks the cached (or freshly re-fetched, via the
+ * main API's internal endpoint -- see internalApi.ts) user record.
  */
 export const authenticate = asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
   const bearer = req.headers.authorization?.startsWith("Bearer ")
@@ -39,7 +37,7 @@ export const authenticate = asyncHandler(async (req: Request, res: Response, nex
     return;
   }
 
-  const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+  const user = await getUserForAuthCached(payload.sub);
 
   if (!user) {
     sendError(res, 401, "Konti ntiboneka.");
@@ -60,12 +58,9 @@ export const authenticate = asyncHandler(async (req: Request, res: Response, nex
 });
 
 /**
- * Same JWT/DB checks as authenticate, but never rejects the request --
- * sets req.user when a valid, active session is present and just calls
- * next() otherwise. For endpoints that must stay reachable by anonymous
- * visitors (e.g. the one free preview video/audio per teacher) but still
- * want to know WHO is calling when they happen to be logged in, such as
- * recording a per-user watch event alongside the anonymous play counter.
+ * Same checks as authenticate, but never rejects the request -- sets
+ * req.user when a valid, active session is present and just calls
+ * next() otherwise.
  */
 export const optionalAuthenticate = asyncHandler(async (req: Request, _res: Response, next: NextFunction) => {
   const bearer = req.headers.authorization?.startsWith("Bearer ")
@@ -78,7 +73,7 @@ export const optionalAuthenticate = asyncHandler(async (req: Request, _res: Resp
   }
   try {
     const payload = verifyToken(token);
-    const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+    const user = await getUserForAuthCached(payload.sub);
     if (user && user.tokenVersion === payload.tokenVersion && user.status === "ACTIVE") {
       req.user = user;
     }

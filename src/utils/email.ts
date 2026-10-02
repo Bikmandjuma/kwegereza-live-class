@@ -28,7 +28,7 @@ export function isEmailConfigured(): boolean {
 /** Where email links should point reuses CORS_ORIGIN since that's already
  * the deployed frontend's real URL, with no separate env var to keep in sync. */
 export function getFrontendUrl(): string {
-  return process.env.CORS_ORIGIN ?? " https://kwegereza.org";
+  return process.env.CORS_ORIGIN ?? "http://localhost:5173";
 }
 
 interface SendEmailInput {

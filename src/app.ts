@@ -7,28 +7,17 @@ import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 import liveClassRoutes from "./routes/liveClassRoutes.js";
 import { sendResponse } from "./utils/apiResponse.js";
 
-/**
- * This is a deliberately small app -- ONLY live-class REST endpoints live
- * here. Everything else (auth, books, dars, chat, etc.) stays on the
- * main API at api.kwegereza.org; this service exists purely because
- * mediasoup needs a compiled native worker that the main API's shared
- * hosting can't build, so live class runs on its own VPS instead. See
- * this repo's README for the full split rationale and deployment notes.
- */
 export function createApp() {
   const app = express();
 
   app.use(
     helmet({
-      // Same reasoning as the main API's app.ts: video thumbnails and
-      // any static assets this service might ever serve need to be
-      // embeddable cross-origin from the main frontend's domain.
       crossOriginResourcePolicy: { policy: "cross-origin" },
     })
   );
   app.use(
     cors({
-      origin: process.env.CORS_ORIGIN ?? " https://kwegereza.org",
+      origin: process.env.CORS_ORIGIN ?? "http://localhost:5173",
       credentials: true,
     })
   );
