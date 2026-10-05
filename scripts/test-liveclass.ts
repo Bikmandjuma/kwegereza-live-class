@@ -1,6 +1,6 @@
 import { io as ioClient, type Socket } from "socket.io-client";
 
-const API = process.env.LIVE_CLASS_TEST_URL ?? "http://localhost:4001";
+const API = process.env.LIVE_CLASS_TEST_URL ?? "https://live-class.kwegereza.org";
 
 async function login(email: string, password: string) {
   const res = await fetch(`${API}/api/auth/login`, {

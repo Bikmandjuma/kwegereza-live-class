@@ -1,5 +1,5 @@
-import { AccessToken, RoomServiceClient, TrackSource, WebhookReceiver } from "livekit-server-sdk";
-import type { ParticipantPermission } from "livekit-server-sdk";
+import { AccessToken, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
+import type { ParticipantPermission, TrackSource } from "livekit-server-sdk";
 
 const apiKey = process.env.LIVEKIT_API_KEY ?? "";
 const apiSecret = process.env.LIVEKIT_API_SECRET ?? "";
@@ -24,8 +24,29 @@ if (!apiKey || !apiSecret || !livekitHost) {
 export const roomService = new RoomServiceClient(livekitHost, apiKey, apiSecret);
 export const webhookReceiver = new WebhookReceiver(apiKey, apiSecret);
 
-export { TrackSource };
 export type { ParticipantPermission };
+
+// Deliberately hardcoded numbers instead of referencing the SDK's own
+// TrackSource.MICROPHONE/SCREEN_SHARE/SCREEN_SHARE_AUDIO constants at
+// runtime: on at least one real deployment, those named properties
+// resolved to undefined even though the installed package version
+// matched exactly (almost certainly a partial/corrupted npm install on
+// that machine, where the protobuf-generated enum binding came up
+// incomplete without npm ever reporting an error) -- and when that
+// happens, it doesn't fail here where it'd be easy to diagnose; it
+// crashes deep inside the SDK's own JWT-signing code with a cryptic
+// "Cannot convert TrackSource undefined to string". These numbers are
+// LiveKit's own wire-format values for this enum (confirmed directly
+// against the installed package: CAMERA=1, MICROPHONE=2,
+// SCREEN_SHARE=3, SCREEN_SHARE_AUDIO=4) and have no dependency on any
+// object's property lookup succeeding -- immune to whatever caused that
+// failure. The `as TrackSource` casts keep everything downstream
+// correctly typed against the SDK's own type (a type-only import, which
+// -- unlike the value import above -- has no runtime existence at all,
+// so it can't be the thing that was undefined).
+const SOURCE_MICROPHONE = 2 as TrackSource;
+const SOURCE_SCREEN_SHARE = 3 as TrackSource;
+const SOURCE_SCREEN_SHARE_AUDIO = 4 as TrackSource;
 
 /**
  * Every grant decision happens HERE, server-side, never trusting
@@ -58,7 +79,7 @@ export async function createClassAccessToken(options: {
     canSubscribe: true,
     canPublishData: true,
     canPublish: isHost,
-    canPublishSources: isHost ? [TrackSource.MICROPHONE, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO] : [],
+    canPublishSources: isHost ? [SOURCE_MICROPHONE, SOURCE_SCREEN_SHARE, SOURCE_SCREEN_SHARE_AUDIO] : [],
   });
   return at.toJwt();
 }
@@ -71,8 +92,8 @@ export async function createClassAccessToken(options: {
 export async function setMicrophoneGranted(roomName: string, identity: string, granted: boolean) {
   const current = await roomService.getParticipant(roomName, identity).catch(() => null);
   const existingSources = (current?.permission?.canPublishSources ?? []) as TrackSource[];
-  const withoutMic = existingSources.filter((s) => s !== TrackSource.MICROPHONE);
-  const nextSources = granted ? [...withoutMic, TrackSource.MICROPHONE] : withoutMic;
+  const withoutMic = existingSources.filter((s) => s !== SOURCE_MICROPHONE);
+  const nextSources = granted ? [...withoutMic, SOURCE_MICROPHONE] : withoutMic;
   await roomService.updateParticipant(roomName, identity, {
     permission: {
       canSubscribe: true,
@@ -85,7 +106,7 @@ export async function setMicrophoneGranted(roomName: string, identity: string, g
   // track needs an explicit mute to go silent immediately rather than
   // whenever the client next renegotiates.
   if (!granted && current) {
-    const micTrack = current.tracks.find((t) => t.source === TrackSource.MICROPHONE);
+    const micTrack = current.tracks.find((t) => t.source === SOURCE_MICROPHONE);
     if (micTrack) await roomService.mutePublishedTrack(roomName, identity, micTrack.sid, true).catch(() => {});
   }
 }
@@ -96,12 +117,8 @@ export async function setMicrophoneGranted(roomName: string, identity: string, g
 export async function setScreenShareGranted(roomName: string, identity: string, granted: boolean) {
   const current = await roomService.getParticipant(roomName, identity).catch(() => null);
   const existingSources = (current?.permission?.canPublishSources ?? []) as TrackSource[];
-  const withoutScreen = existingSources.filter(
-    (s) => s !== TrackSource.SCREEN_SHARE && s !== TrackSource.SCREEN_SHARE_AUDIO
-  );
-  const nextSources = granted
-    ? [...withoutScreen, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO]
-    : withoutScreen;
+  const withoutScreen = existingSources.filter((s) => s !== SOURCE_SCREEN_SHARE && s !== SOURCE_SCREEN_SHARE_AUDIO);
+  const nextSources = granted ? [...withoutScreen, SOURCE_SCREEN_SHARE, SOURCE_SCREEN_SHARE_AUDIO] : withoutScreen;
   await roomService.updateParticipant(roomName, identity, {
     permission: {
       canSubscribe: true,
@@ -111,7 +128,7 @@ export async function setScreenShareGranted(roomName: string, identity: string, 
     },
   });
   if (!granted && current) {
-    const screenTrack = current.tracks.find((t) => t.source === TrackSource.SCREEN_SHARE);
+    const screenTrack = current.tracks.find((t) => t.source === SOURCE_SCREEN_SHARE);
     if (screenTrack) await roomService.mutePublishedTrack(roomName, identity, screenTrack.sid, true).catch(() => {});
   }
 }
