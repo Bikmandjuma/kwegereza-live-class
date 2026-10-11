@@ -103,12 +103,12 @@ export const createLiveClass = asyncHandler(async (req: Request, res: Response) 
     await notifyAllActiveExcept({
       excludeUserId: req.user!.id,
       type: "liveclass.scheduled",
-      title: "Isomo rishya ryateganyijwe",
+      title: "Isomo rishya riteganyijwe",
       body: `${liveClass.title} — ${scheduledDate!.toLocaleString("rw-RW")}`,
       url: `/live-class/${liveClass.id}`,
       eventKey: `liveclass-scheduled-${liveClass.id}`,
     });
-    sendResponse(res, 201, { liveClass: publicClass(liveClass) }, "Isomo ryateganyijwe.");
+    sendResponse(res, 201, { liveClass: publicClass(liveClass) }, "Isomo riteganyijwe.");
   }
 });
 

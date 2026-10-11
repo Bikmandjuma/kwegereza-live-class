@@ -1,6 +1,6 @@
 import { io as ioClient, type Socket } from "socket.io-client";
 
-const API = process.env.LIVE_CLASS_TEST_URL ?? "http://localhost:4001";
+const API = process.env.LIVE_CLASS_TEST_URL ?? "https://live-class.kwegereza.org";
 
 async function login(email: string, password: string) {
   const res = await fetch(`${API}/api/auth/login`, {
@@ -84,7 +84,7 @@ async function main() {
   const createRes = await fetch(`${API}/api/live-classes`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${host.token}` },
-    body: JSON.stringify({ title: "Aqida Ustadh Ahmad" }),
+    body: JSON.stringify({ title: "Sheikh Iradukunda Aboubakr Abuu Asmaa" }),
   }).then((r) => r.json());
   check("Class creation succeeds", createRes.success === true);
   check("Class status is LIVE", createRes.data.liveClass.status === "LIVE");

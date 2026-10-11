@@ -2,20 +2,16 @@ import type { Server, Socket } from "socket.io";
 import {
   closeAttendanceRemote,
   createAttendanceRemote,
-  createRecordingRemote,
   getLiveClassRemote,
   getUserForAuth,
   trackActivity,
   updateLiveClassRemote,
-  updateRecordingRemote,
 } from "../utils/internalApi.js";
 import {
   createClassAccessToken,
   roomService,
   setMicrophoneGranted,
   setScreenShareGranted,
-  startClassRecording,
-  stopClassRecording,
 } from "../utils/livekit.js";
 import { hasPermission, isAdminTier } from "../utils/permissions.js";
 
@@ -60,7 +56,11 @@ interface ClassroomState {
   chatModerators: Set<string>; // userIds (besides the host) allowed to reveal/hide names
   anonLabels: Map<string, string>; // stable pseudonym per user for this class session
   participants: Map<string, Participant>; // key: userId
-  activeEgressId: string | null; // set while a recording is running, see classroom:start-recording
+  // Despite the name, no longer a real LiveKit egress id -- just a
+  // presence flag ("client-recording" | null) so every participant
+  // still sees the recording indicator while the host's own browser is
+  // recording locally. See classroom:start-recording/-stop-recording.
+  activeEgressId: string | null;
 }
 
 function anonLabelFor(state: ClassroomState, userId: string): string {
@@ -145,15 +145,15 @@ export async function endLiveClass(io: Server | null, liveClassId: string) {
     await closeAttendanceRemote({ liveClassId });
 
     // Covers the HOST explicitly ending the class (or the class record
-    // being ended via the REST path) while a recording is still running.
-    // This is NOT the only way a recording finishes -- see
-    // stopClassRecording's own comment for the truly abrupt case, where
-    // this whole function never runs at all (server crash, process
-    // killed) and LiveKit's own egress worker is what eventually stops
-    // itself once the room is gone, still firing egress_ended regardless.
+    // being ended via the REST path) while the client-side recording
+    // flag is still set. Nothing here calls any recording API anymore
+    // -- the host's own browser is what actually stops MediaRecorder
+    // and uploads the file (see useLiveClassRecorder.js), independent
+    // of this event entirely. This is purely clearing the presence
+    // flag so it doesn't linger as "still recording" for a class that
+    // no longer exists.
     if (state.activeEgressId) {
-      await stopClassRecording(state.activeEgressId);
-      await updateRecordingRemote(state.activeEgressId, { status: "ENDING" }).catch(() => {});
+      state.activeEgressId = null;
     }
   }
 
@@ -554,6 +554,17 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
   // creates. Broadcasting classroom:recording-started lets every
   // connected client show a recording indicator immediately, same as a
   // real video-call app would.
+  // Recording is now a 100% client-side affair: the host's OWN browser
+  // mixes the local mic with every remote participant's audio and
+  // records that mixed stream with MediaRecorder (see
+  // useLiveClassRecorder.js), uploading the finished file straight to
+  // the main backend's /recordings/upload once the class ends -- no
+  // LiveKit Egress call, no S3/MinIO credentials needed for this path
+  // at all. This handler's only remaining job is updating
+  // activeEgressId (repurposed here as a plain "is someone currently
+  // recording" flag, not a real egress id) so every OTHER participant
+  // still sees the "Birafatwa" recording indicator -- purely a
+  // presence broadcast now, nothing it does blocks on an external API.
   socket.on("classroom:start-recording", async ({ liveClassId }, ack) => {
     const state = requireHost(liveClassId);
     if (!state) {
@@ -565,9 +576,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       return;
     }
     try {
-      const { egressId } = await startClassRecording(liveClassId);
-      state.activeEgressId = egressId;
-      await createRecordingRemote({ liveClassId, egressId, roomName: liveClassId, startedByUserId: userId });
+      state.activeEgressId = "client-recording";
       io.to(`class:${liveClassId}`).emit("classroom:recording-started");
       ack?.({ ok: true });
     } catch (err: any) {
@@ -585,9 +594,11 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       ack?.({ ok: false, error: "Nta yandikwa rikomeje kuri iri somo." });
       return;
     }
-    const egressId = state.activeEgressId;
-    await stopClassRecording(egressId);
-    await updateRecordingRemote(egressId, { status: "ENDING" }).catch(() => {});
+    // Just clears the presence flag and tells everyone else the
+    // indicator should disappear -- the actual stop (ending
+    // MediaRecorder, uploading the file) happens entirely client-side
+    // in the host's own browser, independently of this event; see
+    // useLiveClassRecorder.js's own stop() and upload flow.
     state.activeEgressId = null;
     io.to(`class:${liveClassId}`).emit("classroom:recording-stopped");
     ack?.({ ok: true });
