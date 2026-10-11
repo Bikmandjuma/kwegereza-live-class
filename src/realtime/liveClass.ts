@@ -21,6 +21,21 @@ import { hasPermission, isAdminTier } from "../utils/permissions.js";
 
 type MicState = "HOST" | "MUTED" | "APPROVED";
 
+// How long a disconnected participant (host or student) is kept in the
+// room, still counted as present, before being treated as having
+// genuinely left. A raw socket.io "disconnect" fires for reasons that
+// have nothing to do with someone actually leaving -- backgrounding a
+// tab (many mobile browsers throttle or suspend a background tab's own
+// timers enough to miss a heartbeat ping), a brief wifi/cell handoff, a
+// laptop lid closing for a few seconds -- and the person is very
+// often still trying to be there. This window is what lets a
+// reconnect within it look, from everyone else's side, like nothing
+// happened at all: no "left the class" toast, no "host disconnected"
+// banner, attendance never closed. Chosen to comfortably cover a
+// background-tab heartbeat lapse or a short network handoff without
+// leaving a room feeling stuck "waiting" for someone who's truly gone.
+const DISCONNECT_GRACE_MS = 45_000;
+
 interface Participant {
   userId: string;
   fullName: string;
@@ -31,6 +46,11 @@ interface Participant {
   handRaised: boolean;
   screenShareApproved: boolean;
   screenShareRequested: boolean;
+  // Set while this participant's socket has disconnected but they
+  // haven't yet been treated as having actually left (see the
+  // DISCONNECT_GRACE_MS handling below). Cleared the moment they
+  // reconnect; only acted on if it fires.
+  pendingLeaveTimer?: NodeJS.Timeout;
 }
 
 interface ClassroomState {
@@ -137,6 +157,20 @@ export async function endLiveClass(io: Server | null, liveClassId: string) {
     }
   }
 
+  // Cancel any grace-window timers still pending for this room (see
+  // DISCONNECT_GRACE_MS) -- the class is ending outright now, so there's
+  // nothing left for any of them to meaningfully do: attendance for
+  // everyone is already closed just above, and the room everyone would
+  // have been notified in is empty seconds from now anyway. Without
+  // this, a lingering timer firing after this function returns would
+  // still run (a stale, harmless, but needless duplicate
+  // close-attendance-and-broadcast) since nothing else clears it.
+  if (state) {
+    for (const p of state.participants.values()) {
+      if (p.pendingLeaveTimer) clearTimeout(p.pendingLeaveTimer);
+    }
+  }
+
   const updated = await updateLiveClassRemote(liveClassId, { status: "ENDED", endedAt: new Date().toISOString() });
 
   if (io && state) {
@@ -198,8 +232,18 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       return;
     }
 
+    // A pending-leave timer means this is a reconnect within the grace
+    // window below (disconnect handler), not a fresh join -- cancel it
+    // so it doesn't fire later and wrongly close out someone who's
+    // actually back. Must happen before anything else touches this
+    // user's entry, since the NEW participant object built just below
+    // replaces it and would otherwise take the live timer reference
+    // down with it, with nothing left able to clearTimeout it.
+    if (existing?.pendingLeaveTimer) clearTimeout(existing.pendingLeaveTimer);
+
     // Idempotent re-join: if this user already has an entry (e.g. a stale
-    // tab), replace their socketId rather than creating a second participant.
+    // tab, or a reconnect within the grace window), replace their
+    // socketId rather than creating a second participant.
     const participant: Participant = {
       userId,
       fullName,
@@ -230,8 +274,18 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     });
     chatChannels.forEach((channel) => socket.join(chatRoom(liveClassId, channel)));
 
-    await createAttendanceRemote(liveClassId, userId);
-    await trackActivity(userId, "CLASS_JOIN", { liveClassId, role: participant.role });
+    // Only for a genuinely first join this session (no prior entry at
+    // all) -- createAttendanceRemote isn't idempotent (it unconditionally
+    // inserts a new row), so calling it again for a reconnect or a
+    // refreshed tab would open a SECOND attendance row while the first
+    // is either still open (grace-window reconnect, whose matching
+    // close was just cancelled above) or was already closed (a genuine
+    // rejoin after really leaving, which is exactly when a new row is
+    // correct). `existing` being set covers both those non-fresh cases.
+    if (!existing) {
+      await createAttendanceRemote(liveClassId, userId);
+      await trackActivity(userId, "CLASS_JOIN", { liveClassId, role: participant.role });
+    }
 
     // The LiveKit token encodes the REAL starting grants (see
     // createClassAccessToken): a host can publish mic + screen share
@@ -650,7 +704,16 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
   // unlike the old mediasoup setup. What's left to do server-side is
   // purely Kwegereza's own bookkeeping: attendance, presence, and
   // telling the rest of the room someone left.
-  socket.on("disconnect", async () => {
+  //
+  // A raw socket.io disconnect is NOT treated as "this person left" --
+  // see DISCONNECT_GRACE_MS above for why. The participant stays in
+  // state.participants (so the roster, attendance, and everyone else's
+  // view of the room are completely unaffected) for one grace window;
+  // only if that window elapses with no reconnection does this become
+  // a real leave. classroom:join's existing idempotent-rejoin handling
+  // (cancelling pendingLeaveTimer, replacing socketId) is what makes a
+  // reconnect inside the window invisible to the rest of the room.
+  socket.on("disconnect", () => {
     const liveClassId: string | undefined = socket.data.currentClassId;
     if (!liveClassId) return;
     const state = classrooms.get(liveClassId);
@@ -658,14 +721,25 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
     const p = state.participants.get(userId);
     if (!p || p.socketId !== socket.id) return; // a newer connection already replaced this one
 
-    state.participants.delete(userId);
-    await closeAttendanceRemote({ liveClassId, userId });
-    await trackActivity(userId, "CLASS_LEAVE", { liveClassId });
+    p.pendingLeaveTimer = setTimeout(async () => {
+      // Re-check rather than trusting the closure's own `p` -- if they
+      // reconnected during the grace window, classroom:join already
+      // replaced this entry (and cancelled this very timer), but that
+      // race is only safe to rely on if this callback double-checks
+      // the CURRENT entry rather than assuming its own capture is
+      // still the live one.
+      const current = state.participants.get(userId);
+      if (!current || current.socketId !== socket.id) return;
 
-    if (state.hostId === userId) {
-      io.to(`class:${liveClassId}`).emit("classroom:host-disconnected", { liveClassId });
-    } else {
-      io.to(`class:${liveClassId}`).emit("classroom:participant-left", { userId });
-    }
+      state.participants.delete(userId);
+      await closeAttendanceRemote({ liveClassId, userId });
+      await trackActivity(userId, "CLASS_LEAVE", { liveClassId });
+
+      if (state.hostId === userId) {
+        io.to(`class:${liveClassId}`).emit("classroom:host-disconnected", { liveClassId });
+      } else {
+        io.to(`class:${liveClassId}`).emit("classroom:participant-left", { userId });
+      }
+    }, DISCONNECT_GRACE_MS);
   });
 }
