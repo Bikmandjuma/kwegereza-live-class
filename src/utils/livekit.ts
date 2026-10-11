@@ -1,5 +1,6 @@
-import { AccessToken, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
+import { AccessToken, EgressClient, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
 import type { ParticipantPermission, TrackSource } from "livekit-server-sdk";
+import { EncodedFileOutput, S3Upload } from "@livekit/protocol";
 
 const apiKey = process.env.LIVEKIT_API_KEY ?? "";
 const apiSecret = process.env.LIVEKIT_API_SECRET ?? "";
@@ -23,6 +24,7 @@ if (!apiKey || !apiSecret || !livekitHost) {
 
 export const roomService = new RoomServiceClient(livekitHost, apiKey, apiSecret);
 export const webhookReceiver = new WebhookReceiver(apiKey, apiSecret);
+export const egressClient = new EgressClient(livekitHost, apiKey, apiSecret);
 
 export type { ParticipantPermission };
 
@@ -131,4 +133,74 @@ export async function setScreenShareGranted(roomName: string, identity: string, 
     const screenTrack = current.tracks.find((t) => t.source === SOURCE_SCREEN_SHARE);
     if (screenTrack) await roomService.mutePublishedTrack(roomName, identity, screenTrack.sid, true).catch(() => {});
   }
+}
+
+// OGG = 2, hardcoded for the same reason as the TrackSource constants
+// above: this is a value from the exact same protobuf-generated package
+// that has already shown undefined-named-property failures on at least
+// one real install, and an audio-only recording's file type is not
+// something worth re-risking that on. This whole app is audio-only (no
+// camera use anywhere in its UI), so every recording is audio-only too
+// -- there is no video track to composite in the first place.
+const AUDIO_FILETYPE_OGG = 2;
+
+const egressS3Config = {
+  accessKey: process.env.EGRESS_S3_ACCESS_KEY ?? "",
+  secret: process.env.EGRESS_S3_SECRET ?? "",
+  bucket: process.env.EGRESS_S3_BUCKET ?? "",
+  region: process.env.EGRESS_S3_REGION ?? "auto",
+  endpoint: process.env.EGRESS_S3_ENDPOINT ?? "",
+};
+
+/**
+ * Starts a room-composite (whole-room, every speaking participant mixed
+ * together) audio recording and returns the egressId immediately --
+ * LiveKit hands this back synchronously, well before the file itself is
+ * anywhere close to done. The actual file only becomes known once the
+ * `egress_ended` webhook arrives (see webhookController.ts), which is
+ * also the ONLY place fileKey/size/duration ever get written -- this
+ * function's caller (liveClass.ts's classroom:start-recording handler)
+ * only ever sees "it started", never a finished file.
+ *
+ * Output goes to S3(-compatible) storage, not a local path on the
+ * egress worker's own disk -- a local filepath would only be reachable
+ * if this service and the egress worker happened to share a volume,
+ * which isn't something to assume about someone else's deployment. See
+ * this project's README for the required EGRESS_S3_* env vars and why
+ * MinIO is the realistic free option if there's no existing cloud
+ * storage account.
+ */
+export async function startClassRecording(roomName: string) {
+  if (!egressS3Config.bucket) {
+    throw new Error("EGRESS_S3_BUCKET is not configured -- recording storage has not been set up on this server.");
+  }
+  const output = new EncodedFileOutput({
+    fileType: AUDIO_FILETYPE_OGG,
+    filepath: `${roomName}/{room_name}-{time}`,
+    output: {
+      case: "s3",
+      value: new S3Upload({
+        accessKey: egressS3Config.accessKey,
+        secret: egressS3Config.secret,
+        bucket: egressS3Config.bucket,
+        region: egressS3Config.region,
+        endpoint: egressS3Config.endpoint,
+      }),
+    },
+  });
+  const info = await egressClient.startRoomCompositeEgress(roomName, { file: output }, { audioOnly: true });
+  return { egressId: info.egressId };
+}
+
+/** Explicit stop, called when a host presses "stop recording" or when a
+ * class ends normally while one is still running. NOT the only way a
+ * recording finishes, by design -- if this service crashes or the host
+ * just closes their device without stopping it first, LiveKit's own
+ * egress worker keeps running independently and stops itself once the
+ * room it's attached to actually closes, still firing the same
+ * `egress_ended` webhook either way. Swallows errors on an egressId
+ * that's already stopped/gone, since by the time this is called from
+ * the room-end path, stopping twice is an expected race, not a bug. */
+export async function stopClassRecording(egressId: string) {
+  await egressClient.stopEgress(egressId).catch(() => {});
 }

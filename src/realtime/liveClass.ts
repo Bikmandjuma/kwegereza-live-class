@@ -2,12 +2,21 @@ import type { Server, Socket } from "socket.io";
 import {
   closeAttendanceRemote,
   createAttendanceRemote,
+  createRecordingRemote,
   getLiveClassRemote,
   getUserForAuth,
   trackActivity,
   updateLiveClassRemote,
+  updateRecordingRemote,
 } from "../utils/internalApi.js";
-import { createClassAccessToken, roomService, setMicrophoneGranted, setScreenShareGranted } from "../utils/livekit.js";
+import {
+  createClassAccessToken,
+  roomService,
+  setMicrophoneGranted,
+  setScreenShareGranted,
+  startClassRecording,
+  stopClassRecording,
+} from "../utils/livekit.js";
 import { hasPermission, isAdminTier } from "../utils/permissions.js";
 
 type MicState = "HOST" | "MUTED" | "APPROVED";
@@ -31,6 +40,7 @@ interface ClassroomState {
   chatModerators: Set<string>; // userIds (besides the host) allowed to reveal/hide names
   anonLabels: Map<string, string>; // stable pseudonym per user for this class session
   participants: Map<string, Participant>; // key: userId
+  activeEgressId: string | null; // set while a recording is running, see classroom:start-recording
 }
 
 function anonLabelFor(state: ClassroomState, userId: string): string {
@@ -113,6 +123,18 @@ export async function endLiveClass(io: Server | null, liveClassId: string) {
     // Close out attendance for everyone still "in" the room (omitting
     // both userId/userIds closes every still-open row for this class).
     await closeAttendanceRemote({ liveClassId });
+
+    // Covers the HOST explicitly ending the class (or the class record
+    // being ended via the REST path) while a recording is still running.
+    // This is NOT the only way a recording finishes -- see
+    // stopClassRecording's own comment for the truly abrupt case, where
+    // this whole function never runs at all (server crash, process
+    // killed) and LiveKit's own egress worker is what eventually stops
+    // itself once the room is gone, still firing egress_ended regardless.
+    if (state.activeEgressId) {
+      await stopClassRecording(state.activeEgressId);
+      await updateRecordingRemote(state.activeEgressId, { status: "ENDING" }).catch(() => {});
+    }
   }
 
   const updated = await updateLiveClassRemote(liveClassId, { status: "ENDED", endedAt: new Date().toISOString() });
@@ -159,6 +181,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
         chatModerators: new Set(),
         anonLabels: new Map(),
         participants: new Map(),
+        activeEgressId: null,
       };
       classrooms.set(liveClassId, state);
     }
@@ -229,6 +252,7 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       participants: participantList(state),
       locked: state.locked,
       namesRevealed: state.namesRevealed,
+      isRecording: Boolean(state.activeEgressId),
       canModerateChat: isHost || state.chatModerators.has(userId),
       chatChannels,
       livekitToken,
@@ -465,6 +489,53 @@ export function registerLiveClassHandlers(io: Server, socket: Socket) {
       return;
     }
     await endLiveClass(io, liveClassId);
+    ack?.({ ok: true });
+  });
+
+  // ---- recording ----
+  // Host-only, same requireHost gate as every other host action here.
+  // The actual file never exists at this point -- only once the
+  // `egress_ended` webhook arrives (see webhookController.ts) does
+  // fileKey/size/duration get written to the recording row this call
+  // creates. Broadcasting classroom:recording-started lets every
+  // connected client show a recording indicator immediately, same as a
+  // real video-call app would.
+  socket.on("classroom:start-recording", async ({ liveClassId }, ack) => {
+    const state = requireHost(liveClassId);
+    if (!state) {
+      ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora gutangira kwandika iri somo." });
+      return;
+    }
+    if (state.activeEgressId) {
+      ack?.({ ok: false, error: "Hari iyandikwa risanzwe rikomeje kuri iri somo." });
+      return;
+    }
+    try {
+      const { egressId } = await startClassRecording(liveClassId);
+      state.activeEgressId = egressId;
+      await createRecordingRemote({ liveClassId, egressId, roomName: liveClassId, startedByUserId: userId });
+      io.to(`class:${liveClassId}`).emit("classroom:recording-started");
+      ack?.({ ok: true });
+    } catch (err: any) {
+      ack?.({ ok: false, error: err?.message ?? "Habaye ikibazo mu gutangira kwandika iri somo." });
+    }
+  });
+
+  socket.on("classroom:stop-recording", async ({ liveClassId }, ack) => {
+    const state = requireHost(liveClassId);
+    if (!state) {
+      ack?.({ ok: false, error: "Gusa umuyobozi w'isomo ashobora guhagarika iyandikwa." });
+      return;
+    }
+    if (!state.activeEgressId) {
+      ack?.({ ok: false, error: "Nta yandikwa rikomeje kuri iri somo." });
+      return;
+    }
+    const egressId = state.activeEgressId;
+    await stopClassRecording(egressId);
+    await updateRecordingRemote(egressId, { status: "ENDING" }).catch(() => {});
+    state.activeEgressId = null;
+    io.to(`class:${liveClassId}`).emit("classroom:recording-stopped");
     ack?.({ ok: true });
   });
 

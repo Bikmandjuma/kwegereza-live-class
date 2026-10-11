@@ -157,3 +157,25 @@ export async function closeAttendanceRemote(input: {
 }): Promise<{ count: number }> {
   return call("PATCH", "/live-class-attendance/close", input);
 }
+
+export async function createRecordingRemote(input: {
+  liveClassId: string;
+  egressId: string;
+  roomName: string;
+  startedByUserId: string;
+}): Promise<void> {
+  await call("POST", "/live-class-recordings", input);
+}
+
+export async function updateRecordingRemote(
+  egressId: string,
+  input: {
+    status?: string;
+    fileKey?: string | null;
+    fileSizeBytes?: string | number;
+    durationSeconds?: number;
+    endedAt?: string | null;
+  }
+): Promise<void> {
+  await call("PATCH", `/live-class-recordings/${egressId}`, input);
+}
